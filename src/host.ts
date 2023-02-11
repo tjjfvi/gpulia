@@ -1,25 +1,108 @@
 /// <reference lib="dom"/>
 
-import { Matrix } from "./matrix.ts";
-import { CalcParams, HostMessage, WorkerMessage } from "./shared.ts";
+import { Matrix, Vector } from "./matrix.ts";
 import { debounce } from "https://deno.land/std@0.167.0/async/debounce.ts";
 import lzstring from "https://esm.sh/lz-string@1.4.4";
 
+if (!("gpu" in navigator)) {
+  alert("WebGPU is not supported.");
+  throw 0;
+}
+
+const gpu = navigator.gpu as GPU;
+const adapter = await gpu.requestAdapter();
+if (!adapter) {
+  alert("Failed to get GPU adapter.");
+  throw 0;
+}
+const device = await adapter.requestDevice();
+
+const shaderModule = device.createShaderModule({
+  code: await fetch("./gpulia.wgsl").then((r) => r.text()),
+});
+
+const bindGroupLayout = device.createBindGroupLayout({
+  entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+  ],
+});
+
+const calcPipeline = device.createComputePipeline({
+  layout: device.createPipelineLayout({
+    bindGroupLayouts: [bindGroupLayout],
+  }),
+  compute: {
+    module: shaderModule,
+    entryPoint: "calc",
+  },
+});
+
+const drawPipeline = device.createComputePipeline({
+  layout: device.createPipelineLayout({
+    bindGroupLayouts: [bindGroupLayout],
+  }),
+  compute: {
+    module: shaderModule,
+    entryPoint: "draw",
+  },
+});
+
+type CalcParams = [number, number, ...Vector, ...Vector, ...Vector];
 class WorkerGroup {
-  memory = new WebAssembly.Memory({
-    initial: 2048,
-    maximum: 2048,
-    shared: true,
+  configWrite = device.createBuffer({
+    size: 64,
+    usage: GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC,
   });
-  workerCount = 16;
-  workers = Array.from({ length: this.workerCount }, (_, id) => {
-    const worker = new Worker("./worker.js");
-    send(worker, {
-      type: "init",
-      ctx: { memory: this.memory, id, count: this.workerCount },
+
+  config = device.createBuffer({
+    size: 64,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  bufferSize = 0;
+
+  calcOut!: GPUBuffer;
+  drawOut!: GPUBuffer;
+  readBuffer!: GPUBuffer;
+  bindGroup!: GPUBindGroup;
+
+  commands!: GPUCommandBuffer;
+
+  init(resultSize: number) {
+    if (this.bufferSize >= resultSize) return;
+    resultSize = Math.ceil(resultSize / 1024) * 1024;
+    this.bufferSize = resultSize;
+    console.log(resultSize);
+
+    this.calcOut?.destroy();
+    this.drawOut?.destroy();
+
+    this.calcOut = device.createBuffer({
+      size: resultSize,
+      usage: GPUBufferUsage.STORAGE,
     });
-    return worker;
-  });
+
+    this.drawOut = device.createBuffer({
+      size: resultSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
+    this.readBuffer = device.createBuffer({
+      size: resultSize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    this.bindGroup = device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: this.config } },
+        { binding: 1, resource: { buffer: this.calcOut } },
+        { binding: 2, resource: { buffer: this.drawOut } },
+      ],
+    });
+  }
 
   ctx;
   constructor(public canvas: HTMLCanvasElement) {
@@ -36,25 +119,44 @@ class WorkerGroup {
     }
     this.rendering = true;
     const [width, height] = params;
+    console.log(params);
     const imageSize = width * height * 4;
-    await Promise.all(
-      this.workers.map(async (worker) => {
-        send(worker, { type: "calc", params });
-        await done(worker);
-      }),
-    );
-    send(this.workers[0], { type: "draw", params: [width, height] });
-    await done(this.workers[0]);
-    const img = new ImageData(
-      new Uint8ClampedArray(
-        this.memory.buffer,
-        imageSize * 2,
-        imageSize,
-      ).slice(),
-      width,
-      height,
-    );
+    this.init(imageSize);
+
+    await this.configWrite.mapAsync(GPUMapMode.WRITE);
+    const configBuffer = this.configWrite.getMappedRange();
+    new Uint32Array(configBuffer).set([width, height]);
+    new Float32Array(configBuffer, 16, 12).set(params.slice(2));
+    console.log(new Uint32Array(configBuffer));
+    console.log(new Float32Array(configBuffer));
+    this.configWrite.unmap();
+
+    const commandEncoder = device.createCommandEncoder();
+
+    commandEncoder.copyBufferToBuffer(this.configWrite, 0, this.config, 0, this.config.size);
+
+    const calcPass = commandEncoder.beginComputePass();
+    calcPass.setPipeline(calcPipeline);
+    calcPass.setBindGroup(0, this.bindGroup);
+    calcPass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+    calcPass.end();
+
+    const drawPass = commandEncoder.beginComputePass();
+    drawPass.setPipeline(drawPipeline);
+    drawPass.setBindGroup(0, this.bindGroup);
+    drawPass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+    drawPass.end();
+
+    commandEncoder.copyBufferToBuffer;
+    commandEncoder.copyBufferToBuffer(this.drawOut, 0, this.readBuffer, 0, this.bufferSize);
+
+    device.queue.submit([commandEncoder.finish()]);
+    await this.readBuffer.mapAsync(GPUMapMode.READ);
+    const output = this.readBuffer.getMappedRange();
+
+    const img = new ImageData(new Uint8ClampedArray(output, 0, imageSize), width, height);
     this.ctx.putImageData(img, 0, 0);
+    this.readBuffer.unmap();
     this.rendering = false;
     if (this.queuedRender) {
       params = this.queuedRender;
@@ -175,22 +277,6 @@ body.addEventListener("wheel", (e) => {
   );
   render();
 });
-
-function send(worker: Worker, msg: HostMessage) {
-  worker.postMessage(msg);
-}
-
-function done(worker: Worker) {
-  return new Promise<void>((resolve) =>
-    worker.addEventListener("message", function handler(event) {
-      const msg = event.data as WorkerMessage;
-      if (msg.type === "done") {
-        resolve();
-        worker.removeEventListener("message", handler);
-      }
-    })
-  );
-}
 
 function resize() {
   width = ab.canvas.width = cd.canvas.width = (window.innerWidth / 2) | 0;
