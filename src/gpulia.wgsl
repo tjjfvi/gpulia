@@ -46,9 +46,9 @@ fn calc(@builtin(global_invocation_id) global_id: vec3<u32>) {
 fn draw(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let index = global_id.x + global_id.y * config.size.x;
     let v = calc_buf[index];
-    var c = 0u;
+    var c = 0.;
     if 0. <= v && v < 1.e31 {
-        c = 255u - u32(exp2(-v / 16.) * 255.);
+        c = 1 - exp2(-v / 16.);
     }
-    draw_buf[index] = (c * 256u * 256u) + (255u * 256u * 256u * 256u);
+    draw_buf[index] = pack4x8unorm(vec4f(c, c, c, 1.));
 }
